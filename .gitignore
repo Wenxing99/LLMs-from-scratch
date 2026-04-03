@@ -1,0 +1,8 @@
+# Local Python and Jupyter artifacts
+**/__pycache__/
+**/.ipynb_checkpoints/
+*.py[cod]
+
+# Local model downloads and training checkpoints
+/ch5_pretraining/gpt2/
+/ch5_pretraining/*.path
