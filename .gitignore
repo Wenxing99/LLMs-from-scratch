@@ -13,3 +13,6 @@
 # Local example data files
 /llm_from_scratch/ch2_working_with_text_data/the-verdict.txt
 /llm_from_scratch/ch5_pretraining/the-verdict.txt
+
+# Local planning notes
+/MINIMIND_WEEK1_PLAN.md
