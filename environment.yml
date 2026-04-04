@@ -1,0 +1,50 @@
+name: LLMs
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10
+  - pip
+  - setuptools>=69
+  - wheel
+  - jupyterlab>=4.0
+  - ipykernel>=6.29
+  - numpy>=1.26
+  - pandas>=2.2.1
+  - matplotlib>=3.7.1
+  - tqdm>=4.66.1
+  - psutil>=5.9.5
+  - requests>=2.31
+  - pip:
+      # Keep the training stack on the official CUDA 12.4 PyTorch wheels.
+      - --extra-index-url https://download.pytorch.org/whl/cu124
+      - torch==2.6.0+cu124
+      - torchaudio==2.6.0+cu124
+      - torchvision==0.21.0+cu124
+      - tiktoken>=0.5.1
+      - tensorflow>=2.18.0
+      - datasets==3.6.0
+      - datasketch==1.6.4
+      - Flask==3.0.3
+      - Flask-Cors==4.0.0
+      - jieba==0.42.1
+      - jsonlines==4.0.0
+      - marshmallow==3.22.0
+      - ngrok==1.4.0
+      - nltk==3.8
+      - openai==1.59.6
+      - pydantic==2.11.5
+      - rich==13.7.1
+      - scikit-learn==1.5.1
+      - sentence-transformers==2.3.1
+      - simhash==2.1.2
+      - transformers==4.57.6
+      - jinja2==3.1.2
+      - trl==0.13.0
+      - ujson==5.1.0
+      - wandb==0.18.3
+      - streamlit==1.50.0
+      - einops==0.8.1
+      - swanlab==0.7.11
+      - modelscope==1.30.0

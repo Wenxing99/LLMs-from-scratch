@@ -2,7 +2,10 @@ import torch
 import torch.nn as nn
 import math
 
-from ch3_attention.mha import MultiHeadAttention
+try:
+    from llm_from_scratch.ch3_attention.mha import MultiHeadAttention
+except ModuleNotFoundError:
+    from ch3_attention.mha import MultiHeadAttention
 
 class FeedForward(nn.Module):
     def __init__(self, cfg):

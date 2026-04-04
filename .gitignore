@@ -6,3 +6,10 @@
 # Local model downloads and training checkpoints
 /ch5_pretraining/gpt2/
 /ch5_pretraining/*.path
+/llm_from_scratch/ch5_pretraining/gpt2/
+/llm_from_scratch/ch5_pretraining/*.path
+/llm_from_scratch/ch5_pretraining/*.pdf
+
+# Local example data files
+/llm_from_scratch/ch2_working_with_text_data/the-verdict.txt
+/llm_from_scratch/ch5_pretraining/the-verdict.txt
