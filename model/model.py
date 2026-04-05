@@ -1,9 +1,12 @@
 import torch
 import torch.nn as nn
+from torch.nn import init
+import torch.nn.functional as F
 import math
 from typing import Optional, Tuple, List, Union
-
-from transformers import PretrainedConfig
+from transformers.activations import ACT2FN
+from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 class FeiFeiMindConfig(PretrainedConfig):
@@ -240,7 +243,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
             (-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]), dim=-1
         )
 
-    # cos / sin 的原始 shape 通常是 [T, D] 或 [B, T, D]
+    # cos / sin 的原始 shape 通常是 [T, D_head] 或 [B, T, D_head]
     # 通过 unsqueeze_dim 在 head 维上插一个维度，方便后面和 q / k 广播
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
@@ -255,6 +258,160 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
 
     return q_embed, k_embed
 
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """把 KV head 复制到和 Q head 数量一致。"""
+
+    # x: [B, T, H_kv, D_head]
+    B, T, num_key_value_heads, head_dim = x.shape
+    if n_rep == 1:
+        return x
+    
+    # x[:, :, :, None, :]: [B, T, H_kv, 1, D_head]
+    # expand 之后: [B, T, H_kv, n_rep, D_head]
+    # reshape 之后: [B, T, H_kv * n_rep, D_head]
+    return (
+        x[:, :, :, None, :]
+        .expand(B, T, num_key_value_heads, n_rep, head_dim)
+        .reshape(B, T, num_key_value_heads*n_rep, head_dim)
+    )
+
+class GroupQueryAttention(nn.Module):
+    """Grouped-Query Attention.
+
+    Q 保持完整的 attention heads 数量；
+    K / V 只保留更少的 KV heads，再通过 repeat_kv 扩展回去和 Q 对齐。
+    """
+
+    def __init__(self, args: FeiFeiMindConfig):
+        super().__init__()
+
+        self.num_key_value_heads = (
+            args.num_attention_heads 
+            if args.num_key_value_heads is None
+            else args.num_key_value_heads
+        )
+
+        # hidden_size 必须能均匀分给所有 Q heads
+        assert args.hidden_size % args.num_attention_heads == 0
+        # Q heads 数量必须能被 KV heads 数量整除，这样 repeat_kv 才能整齐复制
+        assert args.num_attention_heads % self.num_key_value_heads == 0
+
+        self.n_local_heads = args.num_attention_heads
+        self.n_local_kv_heads = self.num_key_value_heads
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        self.head_dim = args.hidden_size // args.num_attention_heads
+
+        # q_proj 输出 [B, T, H_q * D_head]
+        # k_proj / v_proj 输出 [B, T, H_kv * D_head]
+        self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(args.num_attention_heads * self.head_dim, args.hidden_size, bias=False)
+
+        self.attn_dropout = nn.Dropout(args.dropout)
+        self.resid_dropout = nn.Dropout(args.dropout)
+        self.dropout = args.dropout
+        self.flash = (
+            hasattr(torch.nn.functional, "scaled_dot_product_attention")
+            and args.flash_attention
+        )
+
+    def forward(
+            self,
+            x: torch.Tensor,
+            position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+            past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+            use_cache = False,
+            attention_mask: Optional[torch.Tensor] = None,
+    ):
+        """执行一层 GQA，返回注意力输出和可选的 KV cache。"""
+
+        # x: [B, T, D_model]
+        B, T, _ = x.shape
+
+        # xq: [B, T, H_q * D_head]
+        # xk, xv: [B, T, H_kv * D_head]
+        xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+
+        # xq: [B, T, H_q, D_head]
+        # xk, xv: [B, T, H_kv, D_head]
+        xq = xq.view(B, T, self.n_local_heads, self.head_dim)
+        xk = xk.view(B, T, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(B, T, self.n_local_kv_heads, self.head_dim)
+
+        # cos, sin: [T, D_head] 或 [B, T, D_head]
+        cos, sin = position_embeddings
+
+        # RoPE 只改 q / k 的数值，不改 shape
+        # xq: [B, T, H_q, D_head]
+        # xk: [B, T, H_kv, D_head]
+        xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
+
+        # past_key_value[0], past_key_value[1]: [B, T_cache, H_kv, D_head]
+        # 拼接之后：
+        # xk, xv: [B, T_k, H_kv, D_head]
+        if past_key_value is not None:
+            xk = torch.cat([past_key_value[0], xk], dim=1)
+            xv = torch.cat([past_key_value[1], xv], dim=1)
+        past_kv = (xk, xv) if use_cache else None
+
+        # repeat_kv 之后，K / V 的 head 数从 H_kv 扩展到 H_q
+        # transpose 后统一成注意力计算更常见的布局 [B, H, T, D_head]
+        xq, xk, xv = (
+            xq.transpose(1, 2),
+            repeat_kv(xk, self.n_rep).transpose(1, 2),
+            repeat_kv(xv, self.n_rep).transpose(1, 2),
+        )
+        # xq: [B, H_q, T_q, D_head]
+        # xk, xv: [B, H_q, T_k, D_head]
+
+        if (
+            self.flash 
+            and (T > 1) 
+            and (past_key_value is None)
+            and (attention_mask is None or torch.all(attention_mask == 1))
+        ):
+            # output: [B, H_q, T_q, D_head]
+            output = F.scaled_dot_product_attention(
+                xq, xk, xv, 
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=True
+            )
+        else:
+            # xk.transpose(-2, -1): [B, H_q, D_head, T_k]
+            # scores: [B, H_q, T_q, T_k]
+            scores = torch.matmul(xq, xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+            # 只对当前这一步对应的最后 T 列施加 causal mask
+            scores[..., -T:] += torch.triu(
+                torch.full((T, T), float("-inf"), device = scores.device),
+                diagonal = 1
+            )
+
+            if attention_mask is not None:
+                # attention_mask: [B, T_k]
+                # 1 代表可以被attend，0 代表需要被mask掉
+                # scores: [B, H_q, T_q, T_k]
+                extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+                extended_attention_mask = (1.0 - extended_attention_mask) * (-1e9)
+                scores += extended_attention_mask
+
+            # scores: [B, H_q, T_q, T_k]
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            scores = self.attn_dropout(scores)
+
+            # output: [B, H_q, T_q, D_head]
+            output = torch.matmul(scores, xv)
+
+        # output.transpose(1, 2): [B, T, H_q, D_head]
+        # reshape 之后: [B, T, H_q * D_head]
+        # o_proj 之后: [B, T, D_model]
+        # 这里用了 reshape，可以不用 contiguous()；如果用 view，一定要 contiguous()
+        output = output.transpose(1, 2).reshape(B, T, -1)
+        output = self.resid_dropout(self.o_proj(output))
+
+        return output, past_kv
+            
 
 
 
