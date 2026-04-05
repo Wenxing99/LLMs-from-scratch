@@ -454,6 +454,98 @@ class FeedForward(nn.Module):
 
         # down_proj(gated): [B, T, D_model]
         return self.dropout(self.down_proj(gated))
+    
+class MoEGate(nn.Module):
+    """MoE 路由门控模块。"""
+
+    def __init__(self, config: FeiFeiMindConfig):
+        super().__init__()
+        self.config = config
+
+    def forward(self, x):
+        raise NotImplementedError("MoEGate.forward is not implemented yet.")
+
+
+class MoEFeedForward(nn.Module):
+    """MoE 版前馈网络。"""
+
+    def __init__(self, config: FeiFeiMindConfig):
+        super().__init__()
+        self.config = config
+
+    def forward(self, x):
+        raise NotImplementedError("MoEFeedForward.forward is not implemented yet.")
+
+    
+class FeiFeiMindBlock(nn.Module):
+    """一个标准的 Transformer block。
+
+    结构上采用 pre-norm：
+    attention 前先做一次 RMSNorm，
+    attention 后再做一次 RMSNorm 接 MLP，
+    两个子层外面都带残差连接。
+    """
+
+    def __init__(self, layer_id: int, config: FeiFeiMindConfig):
+        super().__init__()
+        self.num_attention_heads = config.num_attention_heads
+        self.hidden_size = config.hidden_size
+        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.self_attention = GroupQueryAttention(config)
+
+        self.layer_id = layer_id
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        self.mlp = FeedForward(config) if not config.use_moe else MoEFeedForward(config)
+
+    def forward(self, 
+                hidden_states,
+                position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+                past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                use_cache = False,
+                attention_mask: Optional[torch.Tensor] = None,
+                ):
+        """执行一个 Transformer block。
+
+        Args:
+            hidden_states: 输入 hidden states，shape 为 [B, T, D_model].
+            position_embeddings: 预计算好的 (cos, sin).
+            past_key_value: 可选的 KV cache.
+            use_cache: 是否返回新的 KV cache.
+            attention_mask: 可选的 attention mask.
+
+        Returns:
+            hidden_states: shape 为 [B, T, D_model] 的 block 输出。
+            present_key_value: 当前层新的 KV cache；如果 use_cache=False，则为 None。
+        """
+
+        # hidden_states: [B, T, D_model]
+        res = hidden_states
+
+        # pre-norm 之后仍然是 [B, T, D_model]
+        # self_attention 返回：
+        # hidden_states: [B, T, D_model]
+        # present_key_value: 可选的 KV cache
+        hidden_states, present_key_value = self.self_attention(
+            self.input_layernorm(hidden_states), # pre-norm
+            position_embeddings,
+            past_key_value,
+            use_cache,
+            attention_mask,
+        )
+
+        # attention 残差连接
+        # hidden_states: [B, T, D_model]
+        hidden_states = res + hidden_states
+
+        # 先做 post-attention layernorm，再过 MLP，最后做第二次残差连接
+        # self.mlp(...) 的输出 shape 仍然是 [B, T, D_model]
+        hidden_states = hidden_states + self.mlp(
+            self.post_attention_layernorm(hidden_states)
+        )
+
+        return hidden_states, present_key_value
 
 
 
