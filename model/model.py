@@ -411,7 +411,50 @@ class GroupQueryAttention(nn.Module):
         output = self.resid_dropout(self.o_proj(output))
 
         return output, past_kv
-            
+
+
+class FeedForward(nn.Module):
+    """Transformer 中的前馈网络。
+
+    当前实现采用 SwiGLU 风格：
+    先分别做 gate_proj 和 up_proj，
+    再用 act(gate_proj(x)) * up_proj(x) 做门控，
+    最后通过 down_proj 投回 hidden_size。
+    """
+
+    def __init__(self, config: FeiFeiMindConfig):
+        super().__init__()
+        if config.intermediate_size is None:
+            intermediate_size = int(config.hidden_size * 8 / 3)
+            # 向上取整到64的倍数
+            config.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
+
+        # gate_proj / up_proj: [B, T, D_model] -> [B, T, D_ff]
+        # down_proj: [B, T, D_ff] -> [B, T, D_model]
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.dropout = nn.Dropout(config.dropout)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, x):
+        """执行一层前馈网络。
+
+        Args:
+            x: 输入 hidden states，shape 为 [B, T, D_model].
+
+        Returns:
+            shape 为 [B, T, D_model] 的输出张量。
+        """
+
+        # gate_proj(x): [B, T, D_ff]
+        # up_proj(x): [B, T, D_ff]
+        # gated: [B, T, D_ff]
+        gated = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+
+        # down_proj(gated): [B, T, D_model]
+        return self.dropout(self.down_proj(gated))
+
 
 
 
