@@ -548,6 +548,15 @@ class FeiFeiMindBlock(nn.Module):
         return hidden_states, present_key_value
     
 class FeiFeiMindModel(nn.Module):
+    """基础语言模型本体。
+
+    结构上包括：
+    token embedding、
+    多层 Transformer blocks、
+    最后一层 RMSNorm，
+    以及预计算好的 RoPE cos / sin 缓存。
+    """
+
     def __init__(self, config: FeiFeiMindConfig):
         super().__init__()
         self.config = config
@@ -555,6 +564,8 @@ class FeiFeiMindModel(nn.Module):
             config.vocab_size,
             config.num_hidden_layers,
         )
+
+        # embed_tokens: [B, T] -> [B, T, D_model]
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.dropout = nn.Dropout(config.dropout)
         self.layers = nn.ModuleList(
@@ -562,6 +573,7 @@ class FeiFeiMindModel(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        # 预先把最大长度范围内的 RoPE cos / sin 表算好，forward 时按位置切片使用
         freqs_cos, freqs_sin = precompute_freqs(
             dim = config.hidden_size // config.num_attention_heads,
             end = config.max_position_embeddings,
@@ -569,6 +581,8 @@ class FeiFeiMindModel(nn.Module):
             rope_scaling = config.rope_scaling,
         )
 
+        # register_buffer 表示这是模型状态的一部分，但不是可训练参数
+        # persistent=False 表示它们不会进入 state_dict；需要时可以从 config 重新计算
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
@@ -580,6 +594,20 @@ class FeiFeiMindModel(nn.Module):
         use_cache: bool = False,
         **kwargs,
     ):
+        """执行基础模型前向传播。
+
+        Args:
+            input_ids: token ids，shape 为 [B, T].
+            attention_mask: 可选的 attention mask.
+            past_key_values: 可选的 KV cache 列表。
+            use_cache: 是否返回新的 KV cache.
+
+        Returns:
+            hidden_states: shape 为 [B, T, D_model] 的最终隐藏状态。
+            presents: 每一层返回的 KV cache 列表。
+            aux_loss: MoE 的辅助损失；dense 路径下通常为 0.
+        """
+
         # input_ids: [B, T]
         B, T = input_ids.shape
 
@@ -593,16 +621,54 @@ class FeiFeiMindModel(nn.Module):
         # 计算start_pos: 如果存在past，则start_pos为已有past序列长度
         # 这里是尝试取第0层cache的key
         # past_key_values[0][0]: [B, T_cache, H_kv, D_head]
-        start_pos = past_key_values[0][0].shpae[1] if past_key_values[0] is not None else 0
+        start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
 
         # Embedding + dropout
-        # hidden_states: [B, T, D]
+        # hidden_states: [B, T, D_model]
         hidden_states = self.dropout(self.embed_tokens(input_ids))
 
+        # position_embeddings:
+        # freqs_cos[start_pos : start_pos + T]: [T, D_head]
+        # freqs_sin[start_pos : start_pos + T]: [T, D_head]
         position_embeddings = (
             self.freqs_cos[start_pos: start_pos + T],
             self.freqs_sin[start_pos: start_pos + T],
         )
+
+        # presents: 长度为 num_hidden_layers 的列表
+        presents = []
+        for layer_idx, (layer, past_key_value) in enumerate(
+            zip(self.layers, past_key_values)
+        ):
+            # hidden_states: [B, T, D_model]
+            # present: 当前层的 KV cache，或 None
+            hidden_states, present = layer(
+                hidden_states,
+                position_embeddings,
+                past_key_value = past_key_value,
+                use_cache = use_cache,
+                attention_mask = attention_mask
+            )
+            presents.append(present)
+
+        # hidden_states: [B, T, D_model]
+        hidden_states = self.norm(hidden_states)
+
+        # dense 路径下 aux_loss 会保持为 0；
+        # 如果某层的 mlp 是 MoEFeedForward，则把各层 aux_loss 累加起来
+        aux_loss = sum(
+            [
+                layer.mlp.aux_loss for layer in self.layers if isinstance(layer.mlp, MoEFeedForward)
+            ],
+            # 构造一个和 hidden_states 同设备同类型的标量 0
+            hidden_states.new_zeros(1).squeeze(),
+        )
+
+        return hidden_states, presents, aux_loss
+
+        
+
+
         
             
 
