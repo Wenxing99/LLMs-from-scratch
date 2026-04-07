@@ -546,6 +546,68 @@ class FeiFeiMindBlock(nn.Module):
         )
 
         return hidden_states, present_key_value
+    
+class FeiFeiMindModel(nn.Module):
+    def __init__(self, config: FeiFeiMindConfig):
+        super().__init__()
+        self.config = config
+        self.vocab_size, self.num_hidden_layers = (
+            config.vocab_size,
+            config.num_hidden_layers,
+        )
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.dropout)
+        self.layers = nn.ModuleList(
+            [FeiFeiMindBlock(l, config) for l in range(self.num_hidden_layers)]
+        )
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        freqs_cos, freqs_sin = precompute_freqs(
+            dim = config.hidden_size // config.num_attention_heads,
+            end = config.max_position_embeddings,
+            rope_base = config.rope_theta,
+            rope_scaling = config.rope_scaling,
+        )
+
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        use_cache: bool = False,
+        **kwargs,
+    ):
+        # input_ids: [B, T]
+        B, T = input_ids.shape
+
+        # 如果传进来的不是老式 past_key_values 列表，而是新式 cache 对象，
+        # 那这份实现先不支持，直接当成没有 past 来处理
+        if hasattr(past_key_values, "layers"):
+            past_key_values = None
+
+        past_key_values = past_key_values or [None] * len(self.layers)
+
+        # 计算start_pos: 如果存在past，则start_pos为已有past序列长度
+        # 这里是尝试取第0层cache的key
+        # past_key_values[0][0]: [B, T_cache, H_kv, D_head]
+        start_pos = past_key_values[0][0].shpae[1] if past_key_values[0] is not None else 0
+
+        # Embedding + dropout
+        # hidden_states: [B, T, D]
+        hidden_states = self.dropout(self.embed_tokens(input_ids))
+
+        position_embeddings = (
+            self.freqs_cos[start_pos: start_pos + T],
+            self.freqs_sin[start_pos: start_pos + T],
+        )
+        
+            
+
+
+
 
 
 
