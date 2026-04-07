@@ -665,6 +665,107 @@ class FeiFeiMindModel(nn.Module):
         )
 
         return hidden_states, presents, aux_loss
+    
+class FeiFeiMindForCausalLM(PreTrainedModel, GenerationMixin):
+    """带语言模型头的 Causal LM 包装器。
+
+    结构上在基础模型外面再接一层 lm_head，
+    把最后一层 hidden states 投影到词表维度，
+    用于生成和自回归语言模型训练。
+    """
+
+    config_class = FeiFeiMindConfig
+
+    def __init__(self, config: FeiFeiMindConfig):
+        super().__init__(config)
+        self.model = FeiFeiMindModel(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        # tie weights:
+        # token embedding 和输出 lm_head 共用同一份权重
+        self.model.embed_tokens.weight = self.lm_head.weight
+
+    def forward(
+            self,
+            input_ids: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            labels: Optional[torch.Tensor] = None,
+            past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+            use_cache: bool = False,
+            logits_to_keep: Union[int, torch.Tensor] = 0, # 类型可以是 int 或者 Tensor
+            **args,
+    ):
+        """执行 Causal LM 前向传播。
+
+        Args:
+            input_ids: token ids，shape 为 [B, T].
+            attention_mask: 可选的 attention mask.
+            labels: 可选的训练标签，shape 为 [B, T].
+            past_key_values: 可选的 KV cache.
+            use_cache: 是否返回新的 KV cache.
+            logits_to_keep: 控制保留哪些位置的 logits；可以是 int 或索引 Tensor。
+
+        Returns:
+            一个 CausalLMOutputWithPast，其中：
+            logits 的 shape 为 [B, T, V]，
+            loss 为可选的语言模型训练损失。
+        """
+
+        # hidden_states: [B, T, D_model]
+        # past_key_values: 每层的 KV cache 列表
+        hidden_states, past_key_values, aux_loss = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            **args,
+        )
+
+        # slice_indeces:
+        # 如果传入 int，则保留最后若干个位置；
+        # 如果传入 Tensor，则按给定索引选取位置
+        # 如果传入0，则保留全部位置，训练用
+        slice_indeces = (
+            slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        )
+
+        # hidden_states[:, slice_indeces, :]: [B, T_keep, D_model]
+        # logits: [B, T_keep, V]
+        logits = self.lm_head(hidden_states[:, slice_indeces, :])
+
+
+        loss = None
+        # logits: [B, T_keep, V]
+        # labels: [B, T]
+        if labels is not None:
+            # shift_logits: [B, T-1, V]
+            shift_logits = logits[..., :-1, :].contiguous()
+            # shift_labels: [B, T-1]
+            shift_labels = labels[..., 1:].contiguous()
+            loss = F.cross_entropy(
+                # 这里view的用法是：最后一维保持不变，还是V，前面的维度全部压成一维
+                # -1表示：这个维度view自动帮忙推出来
+                # shift_logits: [B*(T-1), V]
+                shift_logits.view(-1, shift_logits.size(-1)),
+                # shift_labels: [B*(T-1)]
+                shift_labels.view(-1),
+                ignore_index=-100,  # label 为 -100 的位置不参与 loss 计算
+            )
+
+        # output.logits: [B, T_keep, V]
+        # output.loss: 标量或 None
+        output = CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=past_key_values,
+            hidden_states=hidden_states,
+        )
+        output.aux_loss = aux_loss
+        
+        return output
+        
+    
+
 
         
 
