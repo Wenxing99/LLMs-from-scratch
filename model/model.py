@@ -25,14 +25,14 @@ class FeiFeiMindConfig(PretrainedConfig):
         bos_token_id: int = 1,
         eos_token_id: int = 2,
         hidden_act: str = "silu",
-        hidden_size: int = 512,
+        hidden_size: int = 768,
         intermediate_size: int = None,
         max_position_embeddings: int = 32768,
         num_attention_heads: int = 8,
         num_hidden_layers: int = 8,
-        num_key_value_heads: int = 2,
+        num_key_value_heads: int = 4,
         vocab_size: int = 6400,
-        rms_norm_eps: float = 1e-05,
+        rms_norm_eps: float = 1e-6,
         rope_theta: int = 1000000,
         inference_rope_scaling: bool = False,
         flash_attention: bool = True,
@@ -301,6 +301,10 @@ class GroupQueryAttention(nn.Module):
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.hidden_size // args.num_attention_heads
 
+        self.q_norm = RMSNorm(self.head_dim, eps=args.rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=args.rms_norm_eps)
+
+
         # q_proj 输出 [B, T, H_q * D_head]
         # k_proj / v_proj 输出 [B, T, H_kv * D_head]
         self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False)
@@ -338,6 +342,8 @@ class GroupQueryAttention(nn.Module):
         xq = xq.view(B, T, self.n_local_heads, self.head_dim)
         xk = xk.view(B, T, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(B, T, self.n_local_kv_heads, self.head_dim)
+
+        xq, xk = self.q_norm(xq), self.k_norm(xk)
 
         # cos, sin: [T, D_head] 或 [B, T, D_head]
         cos, sin = position_embeddings
@@ -425,9 +431,10 @@ class FeedForward(nn.Module):
     def __init__(self, config: FeiFeiMindConfig):
         super().__init__()
         if config.intermediate_size is None:
-            intermediate_size = int(config.hidden_size * 8 / 3)
-            # 向上取整到64的倍数
-            config.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
+            # intermediate_size = int(config.hidden_size * 8 / 3)
+            # # 向上取整到64的倍数
+            # config.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
+            config.intermediate_size = math.ceil(config.hidden_size * math.pi / 64) * 64
 
         # gate_proj / up_proj: [B, T, D_model] -> [B, T, D_ff]
         # down_proj: [B, T, D_ff] -> [B, T, D_model]

@@ -5,6 +5,10 @@ import sys
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, "checkpoints")
+
 import argparse  # 命令行参数解析
 import time  # 时间统计
 import warnings  # 警告控制
@@ -31,14 +35,16 @@ from trainer.trainer_utils import (  # 训练工具函数
 # 忽略警告信息，保持输出清洁
 warnings.filterwarnings("ignore")
 
-def train_epoch(epoch, loader, iters, start_step=0, wand=None):
+def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     """运行一个 epoch 的预训练循环。"""
     start_time = time.time()
+    last_step = start_step
 
     # input_ids, labels, attention_mask: [B, T]
     for step, (input_ids, labels, attention_mask) in enumerate(loader, start=start_step+1):
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
+        last_step = step
         attention_mask = attention_mask.to(args.device) 
 
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
@@ -127,23 +133,33 @@ def train_epoch(epoch, loader, iters, start_step=0, wand=None):
                 epoch=epoch,
                 step=step,
                 wandb=wandb,
-                save_dir="../checkpoints",  
+                save_dir=CHECKPOINT_DIR,
             )
 
             model.train()  # 恢复训练模式
+            del state_dict
+
+        del input_ids, labels, res, loss
+
+    if last_step > start_step and last_step % args.accumulation_steps != 0:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="FeiFeiMind Pretraining")
 
     # ========== 基础训练参数 ==========
     parser.add_argument(
-        "--save_dir", type=str, default="../out", help="模型保存目录"
+        "--save_dir", type=str, default=os.path.join(PROJECT_ROOT, "out"), help="模型保存目录"
     )  
     parser.add_argument(
         "--save_weight", default="pretrain", type=str, help="保存权重的前缀名"
     )
     parser.add_argument(
-        "--epochs", type=int, default=1, help="训练轮数（建议1轮zero或2-6轮充分训练）"
+        "--epochs", type=int, default=2, help="训练轮数（建议1轮zero或2-6轮充分训练）"
     )
     parser.add_argument("--batch_size", type=int, default=32, help="batch size")
     parser.add_argument("--learning_rate", type=float, default=5e-4, help="初始学习率")
@@ -156,7 +172,7 @@ if __name__ == "__main__":
         help="训练设备",
     )
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
-    parser.add_argument("--num_workers", type=int, default=0, help="数据加载线程数")
+    parser.add_argument("--num_workers", type=int, default=4, help="数据加载线程数")
 
     # ========== 训练策略参数 ==========
     parser.add_argument(
@@ -164,10 +180,10 @@ if __name__ == "__main__":
     )
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
     parser.add_argument("--log_interval", type=int, default=100, help="日志打印间隔")
-    parser.add_argument("--save_interval", type=int, default=100, help="模型保存间隔")
+    parser.add_argument("--save_interval", type=int, default=1000, help="模型保存间隔")
 
     # ========== 模型架构参数 ==========
-    parser.add_argument("--hidden_size", default=512, type=int, help="隐藏层维度")
+    parser.add_argument("--hidden_size", default=768, type=int, help="隐藏层维度")
     parser.add_argument("--num_hidden_layers", default=8, type=int, help="隐藏层数量")
     parser.add_argument(
         "--max_seq_len", default=512, type=int, help="训练的最大截断长度"
@@ -184,7 +200,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--data_path",
         type=str,
-        default="../dataset/pretrain_t2t_mini.jsonl",  
+        default=os.path.join(PROJECT_ROOT, "dataset", "pretrain_t2t_mini.jsonl"),
         help="预训练数据路径",
     )
     parser.add_argument(
@@ -245,7 +261,7 @@ if __name__ == "__main__":
     # 如果开启了断点续训，尝试加载之前的训练状态
     ckp_data = (
         lm_checkpoint(
-            lm_config, weight=args.save_weight, save_dir="../checkpoints"
+            lm_config, weight=args.save_weight, save_dir=CHECKPOINT_DIR
         )  
         if args.from_resume == 1
         else None
@@ -298,7 +314,12 @@ if __name__ == "__main__":
     - 缩放器: 混合精度训练的梯度缩放
     """
     # 初始化模型和分词器
-    model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
+    model, tokenizer = init_model(
+        lm_config,
+        args.from_weight,
+        save_dir=args.save_dir,
+        device=args.device,
+    )
 
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
 
@@ -333,9 +354,11 @@ if __name__ == "__main__":
 
         if epoch == start_epoch and start_step > 0:  # 第一个epoch且存在检查点
             # 使用跳批采样器，跳过已训练的数据
+            setup_seed(42 + epoch)
+            indices = torch.randperm(len(train_ds)).tolist()
             batch_sampler = SkipBatchSampler(
-                train_sampler or range(len(train_ds)), args.batch_size, start_step
-            )
+                train_sampler or indices, args.batch_size, start_step
+                )
             loader = DataLoader(
                 train_ds,
                 batch_sampler=batch_sampler,
