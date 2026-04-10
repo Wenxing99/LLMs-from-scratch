@@ -183,7 +183,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_interval", type=int, default=1000, help="模型保存间隔")
 
     # ========== 模型架构参数 ==========
-    parser.add_argument("--hidden_size", default=768, type=int, help="隐藏层维度")
+    parser.add_argument("--hidden_size", default=1024, type=int, help="隐藏层维度")
     parser.add_argument("--num_hidden_layers", default=8, type=int, help="隐藏层数量")
     parser.add_argument(
         "--max_seq_len", default=512, type=int, help="训练的最大截断长度"
@@ -200,7 +200,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--data_path",
         type=str,
-        default=os.path.join(PROJECT_ROOT, "dataset", "pretrain_t2t_mini.jsonl"),
+        default=os.path.join(PROJECT_ROOT, "dataset", "pretrain_t2t.jsonl"),
         help="预训练数据路径",
     )
     parser.add_argument(
