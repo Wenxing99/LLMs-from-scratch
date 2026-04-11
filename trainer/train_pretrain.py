@@ -35,10 +35,19 @@ from trainer.trainer_utils import (  # 训练工具函数
 # 忽略警告信息，保持输出清洁
 warnings.filterwarnings("ignore")
 
-def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
+def train_epoch(
+    epoch,
+    loader,
+    iters,
+    total_update_steps,
+    start_step=0,
+    start_update_step=0,
+    wandb=None,
+):
     """运行一个 epoch 的预训练循环。"""
     start_time = time.time()
     last_step = start_step
+    update_step = start_update_step
 
     # input_ids, labels, attention_mask: [B, T]
     for step, (input_ids, labels, attention_mask) in enumerate(loader, start=start_step+1):
@@ -47,31 +56,42 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         last_step = step
         attention_mask = attention_mask.to(args.device) 
 
-        lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
+        lr = get_lr(update_step, total_update_steps, args.learning_rate)
 
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
-        with autocast_ctx:
-            # 前向传播时交给 autocast 自动选择精度；
-            # 这样大部分算子会用半精度执行，通常更省显存也更快
-            res = model(input_ids, labels=labels, attention_mask=attention_mask)
-            # dense 路径下 aux_loss 通常为 0；MoE 路径下会额外加上路由辅助损失
-            loss = res.loss + res.aux_loss
+        should_update = (step % args.accumulation_steps == 0)
 
-            # 为梯度累积服务，可以理解为想模拟更大的 batch size
-            # 因为我们连续 args.accumulation_steps 步才更新参数，
-            # 但每次都做反向传播，如果每次都传原始 loss，不做缩放，那么累积的梯度会是
-            # 原来的 args.accumulation_steps 倍
-            loss = loss / args.accumulation_steps
+        sync_ctx = nullcontext()
+        if (
+            dist.is_initialized()
+            and isinstance(model, DistributedDataParallel)
+            and not should_update
+        ):
+            sync_ctx = model.no_sync()
 
-        # 反向传播
-        # scaler 为“梯度缩放器”，因为混合精度里很多梯度是 fp16，数值范围小，容易出现：
-        # 梯度太小，直接下溢成 0
-        # 所以做法是：先把 loss 放大很多倍，再 backward，更新参数前再把梯度缩回真实大小
-        scaler.scale(loss).backward()
+        with sync_ctx:
+            with autocast_ctx:
+                # 前向传播时交给 autocast 自动选择精度；
+                # 这样大部分算子会用半精度执行，通常更省显存也更快
+                res = model(input_ids, labels=labels, attention_mask=attention_mask)
+                # dense 路径下 aux_loss 通常为 0；MoE 路径下会额外加上路由辅助损失
+                loss = res.loss + res.aux_loss
 
-        if step % args.accumulation_steps == 0:
+                # 为梯度累积服务，可以理解为想模拟更大的 batch size
+                # 因为我们连续 args.accumulation_steps 步才更新参数，
+                # 但每次都做反向传播，如果每次都传原始 loss，不做缩放，那么累积的梯度会是
+                # 原来的 args.accumulation_steps 倍
+                loss = loss / args.accumulation_steps
+
+            # 反向传播
+            # scaler 为“梯度缩放器”，因为混合精度里很多梯度是 fp16，数值范围小，容易出现：
+            # 梯度太小，直接下溢成 0
+            # 所以做法是：先把 loss 放大很多倍，再 backward，更新参数前再把梯度缩回真实大小
+            scaler.scale(loss).backward()
+
+        if should_update:
             # 还原梯度的真实值
             scaler.unscale_(optimizer)
 
@@ -85,6 +105,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             scaler.update() # 更新scaler的缩放因子
 
             optimizer.zero_grad(set_to_none=True) # 清空梯度
+            update_step += 1
 
         if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
@@ -92,7 +113,9 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             current_lr = optimizer.param_groups[-1]["lr"] 
 
             # 这里是当前 epoch 剩余时间的一个粗略估计，单位为分钟
-            eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
+            processed_steps = max(step - start_step, 1)
+            remaining_steps = max(iters - step, 0)
+            eta_min = spend_time / processed_steps * remaining_steps / 60
 
             Logger(
                 f"Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}) loss:{current_loss:.6f} lr:{current_lr:.12f} epoch_Time:{eta_min}min:"
@@ -104,7 +127,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                     {"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min}
                 )
 
-        if (step % args.save_interval == 0 or step == iters) and is_main_process():
+        if (step % args.save_interval == 0) and is_main_process():
             model.eval()
 
             # 构建保存路径
@@ -132,6 +155,9 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                 scaler=scaler,
                 epoch=epoch,
                 step=step,
+                update_step=update_step,
+                batch_size=args.batch_size,
+                accumulation_steps=args.accumulation_steps,
                 wandb=wandb,
                 save_dir=CHECKPOINT_DIR,
             )
@@ -147,6 +173,43 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
+        update_step += 1
+
+    if is_main_process():
+        model.eval()
+
+        moe_suffix = (
+            "_moe" if hasattr(lm_config, "use_moe") and lm_config.use_moe else ""
+        )
+        ckp = f"{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
+
+        if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+            state_dict = model.module.state_dict()
+        else:
+            state_dict = model.state_dict()
+
+        state_dict = {k: v.half() for k, v in state_dict.items()}
+        torch.save(state_dict, ckp)
+
+        lm_checkpoint(
+            lm_config,
+            weight=args.save_weight,
+            model=model,
+            optimizer=optimizer,
+            scaler=scaler,
+            epoch=epoch + 1,
+            step=0,
+            update_step=update_step,
+            batch_size=args.batch_size,
+            accumulation_steps=args.accumulation_steps,
+            wandb=wandb,
+            save_dir=CHECKPOINT_DIR,
+        )
+
+        model.train()
+        del state_dict
+
+    return update_step
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="FeiFeiMind Pretraining")
@@ -172,11 +235,11 @@ if __name__ == "__main__":
         help="训练设备",
     )
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
-    parser.add_argument("--num_workers", type=int, default=4, help="数据加载线程数")
+    parser.add_argument("--num_workers", type=int, default=2, help="数据加载线程数")
 
     # ========== 训练策略参数 ==========
     parser.add_argument(
-        "--accumulation_steps", type=int, default=8, help="梯度累积步数"
+        "--accumulation_steps", type=int, default=2, help="梯度累积步数"
     )
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
     parser.add_argument("--log_interval", type=int, default=100, help="日志打印间隔")
@@ -266,6 +329,11 @@ if __name__ == "__main__":
         if args.from_resume == 1
         else None
     )
+    if args.from_resume == 1 and ckp_data is None:
+        moe_suffix = "_moe" if lm_config.use_moe else ""
+        raise FileNotFoundError(
+            f"未找到 resume checkpoint: {CHECKPOINT_DIR}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}_resume.pth"
+        )
 
     # ========== 3. 设置混合精度 ==========
     """
@@ -322,6 +390,10 @@ if __name__ == "__main__":
     )
 
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    global_effective_batch = world_size * args.batch_size * args.accumulation_steps
+    updates_per_epoch = (len(train_ds) + global_effective_batch - 1) // global_effective_batch
+    total_update_steps = updates_per_epoch * args.epochs
 
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
 
@@ -329,7 +401,7 @@ if __name__ == "__main__":
 
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
 
-    start_epoch, start_step = 0, 0
+    start_epoch, start_step, start_update_step = 0, 0, 0
     if ckp_data:
         # 恢复模型参数
         model.load_state_dict(ckp_data["model"])
@@ -340,6 +412,26 @@ if __name__ == "__main__":
         # 恢复训练进度
         start_epoch = ckp_data["epoch"]
         start_step = ckp_data.get("step", 0)
+        start_update_step = ckp_data.get("update_step")
+        if start_update_step is None:
+            saved_accum = ckp_data.get("accumulation_steps") or args.accumulation_steps
+            start_update_step = ckp_data["step"] // saved_accum
+
+        saved_ws = ckp_data.get("world_size", 1)
+        saved_bs = ckp_data.get("batch_size") or args.batch_size
+        saved_accum = ckp_data.get("accumulation_steps") or args.accumulation_steps
+        current_ws = dist.get_world_size() if dist.is_initialized() else 1
+
+        layout_changed = (
+            saved_ws != current_ws
+            or saved_bs != args.batch_size
+            or saved_accum != args.accumulation_steps
+        )
+
+        if layout_changed and start_step != 0:
+            raise RuntimeError(
+                "跨机器/跨卡数/跨 batch 配置恢复时，只支持在 epoch 边界恢复（step 必须为 0）。"
+            )
 
     if dist.is_initialized():
         # freqs_cos / freqs_sin 是 RoPE 的预计算缓存，不参与训练；
@@ -368,7 +460,15 @@ if __name__ == "__main__":
             Logger(
                 f"Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始"
             )
-            train_epoch(epoch, loader, len(loader) + start_step, start_step, wandb)
+            start_update_step = train_epoch(
+                epoch,
+                loader,
+                len(loader) + start_step,
+                total_update_steps,
+                start_step,
+                start_update_step,
+                wandb,
+            )
         else:  # 默认从头开始
             loader = DataLoader(
                 train_ds,
@@ -378,5 +478,13 @@ if __name__ == "__main__":
                 num_workers=args.num_workers,
                 pin_memory=True,
             )
-            train_epoch(epoch, loader, len(loader), 0, wandb)
+            start_update_step = train_epoch(
+                epoch,
+                loader,
+                len(loader),
+                total_update_steps,
+                0,
+                start_update_step,
+                wandb,
+            )
 

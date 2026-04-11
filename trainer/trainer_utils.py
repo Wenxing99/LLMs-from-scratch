@@ -116,18 +116,7 @@ def lm_checkpoint(
     else:  # 加载模式
         if os.path.exists(resume_path):
             # 恢复训练时统一先从 resume 文件读，里面信息最完整
-            ckp_data = torch.load(resume_path, map_location="cpu")
-            saved_ws = ckp_data.get("world_size", 1)
-            current_ws = dist.get_world_size() if dist.is_initialized() else 1
-
-            if saved_ws != current_ws:
-                # world size 变化后，按比例折算已经走过的 global step
-                ckp_data["step"] = ckp_data["step"] * saved_ws // current_ws
-                Logger(
-                    f"GPU数量变化({saved_ws}→{current_ws})，step已自动转换为{ckp_data['step']}"
-                )
-
-            return ckp_data
+            return torch.load(resume_path, map_location="cpu")
         return None
     
 # 初始化模型
@@ -202,4 +191,3 @@ class SkipBatchSampler(Sampler):
         total_batches = (len(self.sampler) + self.batch_size - 1) // self.batch_size
 
         return max(0, total_batches - self.skip_batches)
-
