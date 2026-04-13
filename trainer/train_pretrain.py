@@ -1,6 +1,7 @@
 import os
 import sys
 
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
