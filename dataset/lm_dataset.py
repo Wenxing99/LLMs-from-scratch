@@ -300,3 +300,63 @@ class SFTDataset(Dataset):
 
         return input_ids, labels, attention_mask
     
+
+class RLAIFDataset(Dataset):
+    """
+    为 PPO / GRPO 这类 on-policy 强化学习阶段准备的 prompt-only 数据集。
+
+    设计思路：
+    - 与 SFT 不同，这里不直接返回 token 级监督标签，而是只提供 prompt。
+    - 真正的回答由当前 policy 在 rollout 阶段现场生成，再交给 reward model
+      或规则函数打分。
+    - 因此返回值里的 ``answer`` 先留空字符串，占位即可；后续训练逻辑通常
+      只会消费 ``prompt``，生成出的 completion 才是真正参与优化的对象。
+    """
+    def __init__(self, jsonl_path, tokenizer, max_length=1024, thinking_ratio=0.5):
+        super().__init__()
+        self.tokenizer = tokenizer
+        # 先保留与其他 dataset 统一的构造参数形式，后续若 rollout 前要做长度裁剪，
+        # trainer 可以直接复用这个配置。
+        self.max_length = max_length
+        # 按概率打开 thinking，让 RL 阶段同时覆盖“显式思考”和“空 think 占位”
+        # 两种 prompt 形态，避免 rollout 只适配单一模板。
+        self.thinking_ratio = thinking_ratio
+        self.samples = load_dataset('json', data_files=jsonl_path, split='train')
+        # 这两个标记当前类里还没直接用到，但先保留，方便后面如果要在
+        # PPO / GRPO 中做 response span 定位或调试时复用。
+        self.bos_id = tokenizer(f'{tokenizer.bos_token}assistant', add_special_tokens=False).input_ids
+        self.eos_id = tokenizer(f'{tokenizer.eos_token}', add_special_tokens=False).input_ids
+
+    def __len__(self):
+        return len(self.samples)
+    
+    def create_chat_prompt(self, conversations):
+        """
+        只渲染“待模型回答之前”的上下文 prompt。
+
+        注意：
+        - 这里对 conversations 做 ``[:-1]``，默认假设样本最后一条不是要喂给
+          policy 的上下文，而是应被截掉的目标答案 / 占位尾项。
+        - add_generation_prompt=True 会在末尾补上 assistant 起始模板，让 rollout
+          引擎从这里继续生成。
+        """
+        conversations = pre_processing_chat(conversations)
+        use_thinking = random.random() < self.thinking_ratio
+        return self.tokenizer.apply_chat_template(
+            conversations[:-1],
+            tokenize=False,
+            open_thinking=use_thinking,
+            add_generation_prompt=True
+        )
+    
+    def __getitem__(self, index):
+        sample = self.samples[index]
+        prompt = self.create_chat_prompt(sample['conversations'])
+
+        return {
+            # rollout 阶段真正需要的是 prompt；回答由当前策略在线生成。
+            'prompt': prompt,
+            # 先保留一个统一字段占位，便于后续 trainer / reward pipeline
+            # 如果想额外塞参考答案或调试信息时不必改 collate 形状。
+            'answer': ""
+        }
